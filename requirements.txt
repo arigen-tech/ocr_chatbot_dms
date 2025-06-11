@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+pdfplumber
+db-sqlite3
+pathlib
+watchdog
+numpy
+pandas
+python-multipart
+ocrmypdf
+SQLAlchemy
+python-docx
