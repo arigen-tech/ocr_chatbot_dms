@@ -80,6 +80,17 @@ class ChatbotProcessor:
     def chat(self, message: str) -> dict:
         """Matches user queries with stored Q&A pairs."""
         try:
+            # First-time message handling
+            greetings = ["hi", "hello", "hey", "hola", "namaste"]
+            well_being_questions = ["how are you", "how are you?", "how's it going", "how do you do"]
+
+            if message.lower() in greetings:
+                return {"response": "Greetings! How can I assist you today?", "error": None}
+
+            if message.lower() in well_being_questions:
+                return {"response": "I am good and ready to help! How can I assist you?", "error": None}
+            
+
             closest_match = get_close_matches(message.lower(), self.qa_pairs.keys(), n=1, cutoff=0.6)
             if closest_match:
                 matched_question = closest_match[0]
@@ -93,6 +104,10 @@ class ChatbotProcessor:
     def get_chat_history(self):
         """Retrieves stored questions."""
         return self.stored_questions
+    
+    def clear_history(self):
+        """Clear stored conversation history"""
+        self.history = []
 
     def start_folder_monitoring(self):
         """Starts a background thread to monitor the directory for new PDFs."""

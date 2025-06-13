@@ -148,9 +148,9 @@ class DocumentProcessor:
         except subprocess.CalledProcessError as e:
             print(f"Error converting {input_path} to .docx: {str(e)}")
             return None    
-    
+
     def extract_text_from_word(self, doc_path):
-        """Extract text from various Word formats."""
+        """Extract text from various Word formats, including images."""
         ext = os.path.splitext(doc_path)[1].lower()
         if ext in ['.doc', '.docm', '.dotx', '.dotm']:
             converted_path = self.convert_to_docx(doc_path)
@@ -164,10 +164,39 @@ class DocumentProcessor:
 
         try:
             doc = Document(doc_path)
-            return "\n".join([para.text for para in doc.paragraphs])
+            text_data = "\n".join([para.text for para in doc.paragraphs])
+
+            # Process images in the document
+            image_texts = self.extract_text_from_word_images(doc)
+
+            return text_data + "\n\n" + image_texts
         except Exception as e:
             print(f"Error extracting text from {doc_path}: {str(e)}")
             return None
+    
+    def extract_text_from_word_images(self, doc):
+        """Extract text from images in the Word document."""
+        image_texts = []
+        temp_dir = "temp_images"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        for rel in doc.part.rels:
+            if "image" in doc.part.rels[rel].target_ref:
+                image = doc.part.rels[rel].target
+                image_ext = os.path.splitext(image)[1].lower()
+                
+                if image_ext in ['.png', '.jpg', '.jpeg']:
+                    image_path = os.path.join(temp_dir, f"image{len(image_texts)}{image_ext}")
+                    with open(image_path, "wb") as f:
+                        f.write(doc.part.rels[rel].target_part.blob)
+                    
+                    try:
+                        text = pytesseract.image_to_string(Image.open(image_path))
+                        image_texts.append(text.strip())
+                    except Exception as e:
+                        print(f"Error extracting text from image {image_path}: {str(e)}")
+        
+        return "\n".join(image_texts)
     
     def extract_text_from_txt(self, txt_path):
         """Extract text from .txt files."""
@@ -233,7 +262,7 @@ class DocumentProcessor:
                 print(f"Error processing document from queue: {e}")
 
     def process_single_document(self, doc_path):
-        """Process a document while ensuring extensions align with DocumentHandler."""
+        """Process a document while ensuring it's not duplicated in the database."""
         conn = self.get_db_connection()
         try:
             doc_path = Path(doc_path)
@@ -243,6 +272,11 @@ class DocumentProcessor:
 
             if doc_path.suffix.lower() not in handler.valid_extensions:
                 print(f"Skipping unsupported file type: {file_name}")
+                return
+            
+            # **Check if file already exists in the database**
+            if self.is_file_in_database(conn, file_name):
+                print(f"Skipping duplicate file: {file_name}")
                 return
 
             print(f"Processing and inserting: {file_name}")
@@ -268,7 +302,7 @@ class DocumentProcessor:
                 )
                 conn.commit()
                 print(f"Successfully stored: {file_name}")
-            
+                
         finally:
             conn.close()
 
