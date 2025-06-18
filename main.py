@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     doc_processor = get_processor()
     doc_processor.start_processing()
 
-    chatbot_processor = ChatbotProcessor.get_instance()  # Initialize chatbot processor
+    # chatbot_processor = ChatbotProcessor.get_instance()  # Initialize chatbot processor
     yield
 
 @app.get("/")

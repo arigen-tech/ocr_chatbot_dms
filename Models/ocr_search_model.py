@@ -8,6 +8,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pathlib import Path
 from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from pyzbar.pyzbar import decode
 from PIL import Image
 import pandas as pd
@@ -37,6 +38,7 @@ class DocumentProcessor:
     
     @classmethod
     def get_instance(cls, base_dir="PDFs_Data", db_name="search-docs.db"):
+    # def get_instance(cls, base_dir="/home/ubuntu/dms_project/dms_documents", db_name="search-docs.db"):
         """Singleton pattern to ensure only one instance exists and loads existing files."""
         if not cls._instance:
             cls._instance = cls(base_dir, db_name)
@@ -177,25 +179,27 @@ class DocumentProcessor:
     def extract_text_from_word_images(self, doc):
         """Extract text from images in the Word document."""
         image_texts = []
-        temp_dir = "temp_images"
+        instance = DocumentProcessor.get_instance()
+        temp_dir = os.path.join(instance.base_dir, "temp_images")
         os.makedirs(temp_dir, exist_ok=True)
 
-        for rel in doc.part.rels:
-            if "image" in doc.part.rels[rel].target_ref:
-                image = doc.part.rels[rel].target
-                image_ext = os.path.splitext(image)[1].lower()
-                
-                if image_ext in ['.png', '.jpg', '.jpeg']:
-                    image_path = os.path.join(temp_dir, f"image{len(image_texts)}{image_ext}")
-                    with open(image_path, "wb") as f:
-                        f.write(doc.part.rels[rel].target_part.blob)
-                    
-                    try:
-                        text = pytesseract.image_to_string(Image.open(image_path))
-                        image_texts.append(text.strip())
-                    except Exception as e:
-                        print(f"Error extracting text from image {image_path}: {str(e)}")
-        
+
+        for rel in doc.part.rels.values():
+            if rel.reltype == RT.IMAGE:
+                image_part = rel.target_part
+                image_bytes = image_part.blob
+                image_ext = os.path.splitext(image_part.partname)[1].lower()
+                image_path = os.path.join(temp_dir, f"image{len(image_texts)}{image_ext}")
+
+                with open(image_path, "wb") as f:
+                    f.write(image_bytes)
+
+                try:
+                    text = pytesseract.image_to_string(Image.open(image_path))
+                    image_texts.append(text.strip())
+                except Exception as e:
+                    print(f"Error extracting text from image {image_path}: {str(e)}")
+
         return "\n".join(image_texts)
     
     def extract_text_from_txt(self, txt_path):
@@ -317,23 +321,46 @@ class DocumentProcessor:
             conn.close()
 
     def search_database(self, query, selected_files=None):
-        """Search the database for documents containing the specified query."""
+        """Search the database for documents containing the specified query, including special characters."""
         conn = self.get_db_connection()
         try:
             cursor = conn.cursor()
+
+            fts_query = f'"{query}"'
+
             if selected_files:
                 placeholders = ','.join('?' * len(selected_files))
-                cursor.execute(f"""
+                match_sql = f"""
                     SELECT DISTINCT file_name 
                     FROM document_data 
                     WHERE content MATCH ? 
                     AND file_name IN ({placeholders})
-                """, (query, *selected_files))
+                """
+                cursor.execute(match_sql, (fts_query, *selected_files))
             else:
-                cursor.execute("SELECT DISTINCT file_name FROM document_data WHERE content MATCH ?", (query,))
-            return [row[0] for row in cursor.fetchall()]
+                cursor.execute("SELECT DISTINCT file_name FROM document_data WHERE content MATCH ?", (fts_query,))
+            
+            results = [row[0] for row in cursor.fetchall()]
+
+            # Fallback to LIKE if MATCH fails or returns nothing
+            if not results:
+                wildcard_query = f"%{query}%"
+                if selected_files:
+                    like_sql = f"""
+                        SELECT DISTINCT file_name 
+                        FROM document_data 
+                        WHERE content LIKE ? 
+                        AND file_name IN ({placeholders})
+                    """
+                    cursor.execute(like_sql, (wildcard_query, *selected_files))
+                else:
+                    cursor.execute("SELECT DISTINCT file_name FROM document_data WHERE content LIKE ?", (wildcard_query,))
+                results = [row[0] for row in cursor.fetchall()]
+
+            return results
         finally:
             conn.close()
+
     
     def clean_database(self):
         """Delete all entries in the document_data table, effectively resetting the database."""
