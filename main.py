@@ -3,10 +3,16 @@ from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
 from Models.ocr_search_model import DocumentProcessor
-from Models.ai_chatbot_model import ChatbotProcessor
+from Models.ai_chatbot_model import ChatbotProcessor #use when you want to use BERT LLM
+# from Models.ai_model import ChatbotProcessor #use when you want to use Ollama LLM(more smater then BERT)
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+"""
+Commands to run before using Ollama
+1. ollama serve
+2. ollama run gemma3:1b
+"""
 
 class SearchRequest(BaseModel):
     query: str
