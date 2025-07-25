@@ -3,13 +3,13 @@ from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
 from Models.ocr_search_model import DocumentProcessor
-from Models.ai_chatbot_model import ChatbotProcessor #use when you want to use BERT LLM
+from Models.ai_chatbot_model import ChatbotProcessor #use when you want to use SBERT LLM
 # from Models.ai_model import ChatbotProcessor #use when you want to use Ollama LLM(more smater then BERT)
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 """
-Commands to run before using Ollama
+Commands to run when applying Ollama 
 1. ollama serve
 2. ollama run gemma3:1b
 """
@@ -27,7 +27,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","https://arigen-tech.github.io/dms-ui", "http://52.66.126.151"],  
+    allow_origins=["http://localhost:3000","https://arigen-tech.github.io/dms-ui", "http://52.66.126.151", "https://103.133.215.182"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -153,7 +153,7 @@ async def get_chat_history():
 
 def start_api_server():
     """Start the FastAPI server."""
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8450)
 
 if __name__ == "__main__":
     start_api_server()

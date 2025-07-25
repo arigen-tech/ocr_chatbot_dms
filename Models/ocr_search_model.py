@@ -37,22 +37,30 @@ class DocumentProcessor:
     _lock = threading.Lock()
     
     @classmethod
-    def get_instance(cls, base_dir="PDFs_Data", db_name="search-docs.db"):
     # def get_instance(cls, base_dir="/home/ubuntu/dms_project/dms_documents", db_name="search-docs.db"):
-        """Singleton pattern to ensure only one instance exists and loads existing files."""
+    # def get_instance(cls, base_dir=["E:\DMS_Document", "E:\DMS"], db_name="search-docs.db"):
+    def get_instance(cls, base_dirs=["PDFs_Data", "Documentation"], db_name="search-docs.db"):
+        """Singleton accessor that supports multiple directories."""
         if not cls._instance:
-            cls._instance = cls(base_dir, db_name)
+            cls._instance = cls(base_dirs, db_name)
             cls._instance.load_existing_documents()
         return cls._instance
 
-    def __init__(self, base_dir, db_name):
-        if not base_dir or not db_name:
-            raise ValueError("base_dir and db_path are required")
-            
-        self.base_dir = Path(base_dir)
-        self.db_path = self.base_dir / db_name
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, base_dirs, db_name):
+        """Initialize with multiple base directories."""
+        if not base_dirs or not db_name:
+            raise ValueError("base_dirs and db_name are required")
+        self.base_dirs = [Path(d) for d in base_dirs]
+        self.db_path = self.base_dirs[0] / db_name  # Store DB in first folder
+        for base_dir in self.base_dirs:
+            base_dir.mkdir(parents=True, exist_ok=True)
         self._initialize_db()
+    
+    def _get_valid_extensions(self):
+        """Return a list of supported extensions."""
+        return ['.pdf', '.txt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp',
+                '.docx', '.doc', '.docm', '.dotx', '.dotm',
+                '.xlsx', '.xls', '.xlsm', '.csv', '.xlsb']
 
     def _initialize_db(self):
         """Create the db file inside base_dir if it doesn't exist or recreate to include missing columns."""
@@ -92,19 +100,18 @@ class DocumentProcessor:
         return sqlite3.connect(self.db_path)
 
     def load_existing_documents(self):
-        """Scan all subdirectories for documents and add them to the database dynamically."""
-        image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp']
-        word_extensions = ['.docx', '.doc', '.docm', '.dotx', 'dotm']
-        excel_extensions = ['.xlsx', '.xls', '.xlsm', '.csv', '.xlsb']
-        valid_extensions = ['.pdf', '.txt'] + image_extensions + word_extensions + excel_extensions        
-        doc_files = [f for f in self.base_dir.rglob("*") if f.suffix in valid_extensions]
+        """Scan all base directories and index documents."""
+        doc_files = []
+        valid_exts = set(self._get_valid_extensions())
+
+        for base_dir in self.base_dirs:
+            doc_files.extend(f for f in base_dir.rglob("*") if f.suffix.lower() in valid_exts)
 
         if not doc_files:
-            print(f"No Documents found in {self.base_dir}")
+            print("No Documents found across configured directories.")
             return
 
         print(f"Loading {len(doc_files)} Documents into the database...")
-
         for doc_path in doc_files:
             self.process_single_document(str(doc_path))
 
@@ -376,12 +383,14 @@ class DocumentProcessor:
             conn.close()
 
     def start_processing(self):
-        """Start the document processing service."""
+        """Begin monitoring all folders with Watchdog."""
         self.load_existing_documents()
 
-        event_handler = DocumentHandler(self)
         observer = Observer()
-        observer.schedule(event_handler, str(self.base_dir), recursive=True)
-        observer.start()
+        event_handler = DocumentHandler(self)
 
+        for base_dir in self.base_dirs:
+            observer.schedule(event_handler, str(base_dir), recursive=True)
+
+        observer.start()
         return observer

@@ -35,7 +35,7 @@ class ChatbotProcessor:
 
     def __init__(self):
         """Initialize chatbot processor and auto-load existing PDFs."""
-        # Applied BERT API here
+        # Applied SBERT API here
         self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
         self.question_embeddings = []
 

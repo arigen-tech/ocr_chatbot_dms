@@ -11,3 +11,7 @@ python-multipart
 ocrmypdf
 SQLAlchemy
 python-docx
+pytesseract
+pyzbar
+openpyxl
+sentence-transformers
