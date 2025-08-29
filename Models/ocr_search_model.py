@@ -13,6 +13,9 @@ from pyzbar.pyzbar import decode
 from PIL import Image
 import pandas as pd
 import openpyxl
+import json
+from unicodedata import normalize
+import hashlib
 
 class DocumentHandler(FileSystemEventHandler):
     """Handler for document file system events."""
@@ -144,20 +147,20 @@ class DocumentProcessor:
             return None, None
         
     def convert_to_docx(self, input_path):
-        """Convert .doc, .docm, .dotx, .dotm to .docx using unoconv."""
+        """ Convert .doc, .docm, .dotx, .dotm to .docx using unoconv. Always returns a string (output path) or None."""
+        input_path = str(input_path)  # Ensure string for subprocess
         output_path = os.path.splitext(input_path)[0] + ".docx"
         try:
             subprocess.run(["unoconv", "-f", "docx", "-o", output_path, input_path], check=True)
-
             if os.path.exists(output_path):
-                return output_path
+                return output_path  # always a string
             else:
                 print(f"Conversion failed: {input_path} → {output_path}")
                 return None
         except subprocess.CalledProcessError as e:
             print(f"Error converting {input_path} to .docx: {str(e)}")
-            return None    
-
+            return None
+    
     def extract_text_from_word(self, doc_path):
         """Extract text from various Word formats, including images."""
         ext = os.path.splitext(doc_path)[1].lower()
@@ -187,22 +190,20 @@ class DocumentProcessor:
         """Extract text from images in the Word document."""
         image_texts = []
         instance = DocumentProcessor.get_instance()
-        temp_dir = os.path.join(instance.base_dir, "temp_images")
-        os.makedirs(temp_dir, exist_ok=True)
-
-
+        temp_dir = instance.base_dirs[0] / "temp_images"
+        temp_dir.mkdir(parents=True, exist_ok=True)
         for rel in doc.part.rels.values():
             if rel.reltype == RT.IMAGE:
                 image_part = rel.target_part
                 image_bytes = image_part.blob
                 image_ext = os.path.splitext(image_part.partname)[1].lower()
-                image_path = os.path.join(temp_dir, f"image{len(image_texts)}{image_ext}")
+                image_path = temp_dir / f"image{len(image_texts)}{image_ext}"
 
                 with open(image_path, "wb") as f:
                     f.write(image_bytes)
 
                 try:
-                    text = pytesseract.image_to_string(Image.open(image_path))
+                    text = pytesseract.image_to_string(Image.open(str(image_path)))
                     image_texts.append(text.strip())
                 except Exception as e:
                     print(f"Error extracting text from image {image_path}: {str(e)}")
@@ -256,9 +257,15 @@ class DocumentProcessor:
             print(f"Error extracting from Excel {excel_path}: {str(e)}")
             return None
 
+    @staticmethod
+    def clean_filename(self, name):
+        name = normalize('NFKC', name).strip().replace('"', '').replace("'", '')
+        return name
+    
     def is_file_in_database(self, conn, file_name):
         """Check if a file exists in the database."""
         cursor = conn.cursor()
+        file_name = self.clean_filename(file_name)
         cursor.execute("SELECT 1 FROM document_data WHERE file_name = ?", (file_name,))
         return cursor.fetchone() is not None
     
@@ -271,21 +278,39 @@ class DocumentProcessor:
                 self.processing_queue.task_done()
             except Exception as e:
                 print(f"Error processing document from queue: {e}")
+    
+    def log_failed_file(self, file_name):
+        """ Stores failed/corrupted/unreadable file names in failed_files.json as a JSON list. Ensures uniqueness—no duplicate names."""
+        failed_log_path = self.db_path.parent / "failed_files.json"
+        try:
+            if failed_log_path.exists():
+                with open(failed_log_path, "r", encoding="utf-8") as f:
+                    existing_names = set(json.load(f))
+            else:
+                existing_names = set()
+            
+            file_name = self.clean_filename(file_name)
+            if file_name not in existing_names:
+                existing_names.add(file_name)
+                with open(failed_log_path, "w", encoding="utf-8") as f:
+                    json.dump(sorted(existing_names), f, ensure_ascii=False, indent=2)
+        except Exception as log_e:
+            print(f"[Log Error] Could not write to failed_files.json: {log_e}")
+
 
     def process_single_document(self, doc_path):
         """Process a document while ensuring it's not duplicated in the database."""
         conn = self.get_db_connection()
         try:
             doc_path = Path(doc_path)
-            file_name = doc_path.name
+            file_name = self.clean_filename(doc_path.name)
 
-            handler = DocumentHandler(self)  # Instantiate the handler to access valid extensions
+            handler = DocumentHandler(self)
 
             if doc_path.suffix.lower() not in handler.valid_extensions:
                 print(f"Skipping unsupported file type: {file_name}")
                 return
             
-            # **Check if file already exists in the database**
             if self.is_file_in_database(conn, file_name):
                 print(f"Skipping duplicate file: {file_name}")
                 return
@@ -293,26 +318,43 @@ class DocumentProcessor:
             print(f"Processing and inserting: {file_name}")
 
             text, qr_data = None, None
+            
+            try:
+                if doc_path.suffix.lower() in handler.image_extensions:
+                    text, qr_data = self.extract_text_from_image(doc_path)
+                elif doc_path.suffix.lower() in handler.word_extensions:
+                    text = self.extract_text_from_word(doc_path)
+                elif doc_path.suffix.lower() in handler.excel_extensions:
+                    text = self.extract_text_from_excel(doc_path)
+                elif doc_path.suffix.lower() == ".pdf":
+                    text, qr_data = self.extract_text_from_pdf(doc_path)
+                elif doc_path.suffix.lower() == ".txt":
+                    text = self.extract_text_from_txt(doc_path)
 
-            if doc_path.suffix.lower() in handler.image_extensions:
-                text, qr_data = self.extract_text_from_image(doc_path)
-            elif doc_path.suffix.lower() in handler.word_extensions:
-                text = self.extract_text_from_word(doc_path)
-            elif doc_path.suffix.lower() in handler.excel_extensions:
-                text = self.extract_text_from_excel(doc_path)
-            elif doc_path.suffix.lower() == ".pdf":
-                text, qr_data = self.extract_text_from_pdf(doc_path)
-            elif doc_path.suffix.lower() == ".txt":
-                text = self.extract_text_from_txt(doc_path)
+            except Exception as inner_e:
+                print(f"Exception while extracting from {file_name}: {inner_e}")
+                self.log_failed_file(file_name)
+                return
+            
+            text_is_empty = (text is None or (isinstance(text, str) and not text.strip()))
+            qr_missing_in_pdf_or_image = (
+                (doc_path.suffix.lower() in handler.image_extensions + [".pdf"])
+                and qr_data is None
+            )
 
-            if text:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO document_data (file_name, content, qr_data) VALUES (?, ?, ?);",
-                    (file_name, text, qr_data)
-                )
-                conn.commit()
-                print(f"Successfully stored: {file_name}")
+            if text_is_empty:
+                print(f"Failed to extract text from: {file_name}")
+                self.log_failed_file(file_name)
+                return
+
+            
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO document_data (file_name, content, qr_data) VALUES (?, ?, ?);",
+                (file_name, text, qr_data)
+            )
+            conn.commit()
+            print(f"Successfully stored: {file_name}")
                 
         finally:
             conn.close()
@@ -374,7 +416,7 @@ class DocumentProcessor:
         conn = self.get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM document_data")  # Remove all records
+            cursor.execute("DELETE FROM document_data")
             conn.commit()
             print("Database cleaned successfully.")
         except sqlite3.Error as e:

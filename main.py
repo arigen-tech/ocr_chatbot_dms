@@ -7,6 +7,7 @@ from Models.ai_chatbot_model import ChatbotProcessor #use when you want to use S
 # from Models.ai_model import ChatbotProcessor #use when you want to use Ollama LLM(more smater then BERT)
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import json
 
 """
 Commands to run when applying Ollama 
@@ -63,6 +64,20 @@ async def get_files():
         return {"files": files}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/failed-files")
+async def get_failed_files():
+    """API to get the list of failed/corrupted files from failed_files.json."""
+    processor = DocumentProcessor.get_instance()
+    failed_log_path = processor.db_path.parent / "failed_files.json"
+    try:
+        if not failed_log_path.exists():
+            return {"failed_files": []}
+        with open(failed_log_path, "r", encoding="utf-8") as f:
+            failed_files = json.load(f)
+        return {"failed_files": failed_files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search/selected")
 async def search_in_selected_files(request: SearchRequest):
@@ -153,7 +168,7 @@ async def get_chat_history():
 
 def start_api_server():
     """Start the FastAPI server."""
-    uvicorn.run(app, host="0.0.0.0", port=8450)
+    uvicorn.run(app, host="0.0.0.0", port=8950)
 
 if __name__ == "__main__":
     start_api_server()
