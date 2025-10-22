@@ -2,12 +2,13 @@ from fastapi import FastAPI, Query, HTTPException, File, UploadFile
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
-from Models.ocr_search_model import DocumentProcessor
+from Models.ocr_search_model_1 import DocumentProcessor
 from Models.ai_chatbot_model import ChatbotProcessor #use when you want to use SBERT LLM
 # from Models.ai_model import ChatbotProcessor #use when you want to use Ollama LLM(more smater then BERT)
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import json
+# from Models.ocr_search_model_1 import RemoteFileManager
 
 """
 Commands to run when applying Ollama 
@@ -33,6 +34,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# remote_manager = RemoteFileManager()
+# remote_manager=remote_manager
 
 def get_processor():
     """Get the DocumentProcessor instance."""

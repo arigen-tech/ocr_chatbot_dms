@@ -4,12 +4,8 @@ import threading
 import subprocess
 import pdfplumber
 import pytesseract
-import pandas as pd
-import openpyxl
-import json
-import hashlib
-import paramiko
-import stat
+import sys
+import contextlib
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pathlib import Path
@@ -17,41 +13,9 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from pyzbar.pyzbar import decode
 from PIL import Image
-from unicodedata import normalize
-from io import BytesIO
-from remote_config import REMOTE_HOST, REMOTE_PORT, REMOTE_USERNAME, REMOTE_PASSWORD, REMOTE_BASE_DIR
-
-class RemoteFileManager:
-    def __init__(self):
-        self.host = REMOTE_HOST
-        self.port = REMOTE_PORT
-        self.username = REMOTE_USERNAME
-        self.password = REMOTE_PASSWORD
-        self.base_dirs = REMOTE_BASE_DIR
-        self.sftp = self._connect()
-
-    def _connect(self):
-        transport = paramiko.Transport((self.host, self.port))
-        transport.connect(username=self.username, password=self.password)
-        return paramiko.SFTPClient.from_transport(transport)
-
-    def list_files(self, valid_exts):
-        files = []
-        def walk_dir(remote_dir):
-            for entry in self.sftp.listdir_attr(remote_dir):
-                remote_path = f"{remote_dir}/{entry.filename}"
-                if stat.S_ISDIR(entry.st_mode):
-                    walk_dir(remote_path)
-                elif any(entry.filename.lower().endswith(ext) for ext in valid_exts):
-                    files.append(remote_path)
-        walk_dir(self.base_dirs)
-        return files
-
-    def fetch_file(self, remote_path):
-        file_obj = BytesIO()
-        self.sftp.getfo(remote_path, file_obj)
-        file_obj.seek(0)
-        return file_obj
+import pandas as pd
+import openpyxl
+import json
 
 class DocumentHandler(FileSystemEventHandler):
     """Handler for document file system events."""
@@ -74,22 +38,27 @@ class DocumentHandler(FileSystemEventHandler):
 class DocumentProcessor:
     _instance = None
     _lock = threading.Lock()
-
+    
     @classmethod
-    def get_instance(cls, *args, **kwargs):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = cls(*args, **kwargs)
+    # def get_instance(cls, base_dir="/home/ubuntu/dms_project/dms_documents", db_name="search-docs.db"):
+    # def get_instance(cls, base_dirs=["PDFs_Data", "Documentation"], db_name="search-docs.db"):
+    def get_instance(cls, base_dirs=["E:\FTP\DMS_Document"], db_name="search-docs.db"):
+        """Singleton accessor that supports multiple directories."""
+        if not cls._instance:
+            cls._instance = cls(base_dirs, db_name)
+            cls._instance.load_existing_documents()
         return cls._instance
 
-    def __init__(self, remote_manager=None, db_name="search-docs.db"):
-        """Initialize for remote-only scanning."""
-        self.remote_manager = remote_manager
-        # Save db and failed log in current local directory (or change as needed)
-        self.db_path = Path(db_name)
-        self.failed_log_path = Path("failed_files.json")
+    def __init__(self, base_dirs, db_name):
+        """Initialize with multiple base directories."""
+        if not base_dirs or not db_name:
+            raise ValueError("base_dirs and db_name are required")
+        self.base_dirs = [Path(d) for d in base_dirs]
+        self.db_path = self.base_dirs[0] / db_name  # Store DB in first folder
+        for base_dir in self.base_dirs:
+            base_dir.mkdir(parents=True, exist_ok=True)
         self._initialize_db()
-
+    
     def _get_valid_extensions(self):
         """Return a list of supported extensions."""
         return ['.pdf', '.txt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp',
@@ -107,29 +76,24 @@ class DocumentProcessor:
 
         if table_exists:
             # Fetch existing data to migrate
-            cursor.execute("SELECT file_name, content, qr_data FROM document_data;")
+            cursor.execute("SELECT file_name, content FROM document_data;")
             existing_data = cursor.fetchall()
+
             # Drop the old virtual table
             cursor.execute("DROP TABLE document_data;")
             conn.commit()
-
-        # Create the new virtual table with the content_hash column
+        
+        # Create the new virtual table with the qr_data column
         cursor.execute("""
             CREATE VIRTUAL TABLE document_data USING FTS5(
-                file_name, content, qr_data, content_hash
+                file_name, content, qr_data
             );
         """)
         conn.commit()
 
-        # Restore the old data into the newly created table (without content_hash)
+        # Restore the old data into the newly created table
         if table_exists:
-            for row in existing_data:
-                file_name, content, qr_data = row
-                content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest() if content else None
-                cursor.execute(
-                    "INSERT INTO document_data (file_name, content, qr_data, content_hash) VALUES (?, ?, ?, ?);",
-                    (file_name, content, qr_data, content_hash)
-                )
+            cursor.executemany("INSERT INTO document_data (file_name, content) VALUES (?, ?);", existing_data)
             conn.commit()
 
         conn.close()
@@ -139,21 +103,20 @@ class DocumentProcessor:
         return sqlite3.connect(self.db_path)
 
     def load_existing_documents(self):
-        """Scan only remote server and index documents."""
-        if not self.remote_manager:
-            print("Remote manager not configured.")
-            return
-
+        """Scan all base directories and index documents."""
+        doc_files = []
         valid_exts = set(self._get_valid_extensions())
-        doc_files = self.remote_manager.list_files(valid_exts)
+
+        for base_dir in self.base_dirs:
+            doc_files.extend(f for f in base_dir.rglob("*") if f.suffix.lower() in valid_exts)
 
         if not doc_files:
-            print("No Documents found on remote server.")
+            print("No Documents found across configured directories.")
             return
 
-        print(f"Loading {len(doc_files)} Documents from remote server into the database...")
-        for remote_path in doc_files:
-            self.process_single_document(remote_path)
+        print(f"Loading {len(doc_files)} Documents into the database...")
+        for doc_path in doc_files:
+            self.process_single_document(str(doc_path))
 
         print("Database initialization complete.")
 
@@ -162,23 +125,71 @@ class DocumentProcessor:
         full_text = ""
         qr_content = set()
 
+        # Helper to silence C-level stderr (zbar assertions) during decode calls
+        @contextlib.contextmanager
+        def _suppress_stderr():
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    old_stderr_fno = os.dup(2)
+                    os.dup2(devnull.fileno(), 2)
+                    try:
+                        yield
+                    finally:
+                        os.dup2(old_stderr_fno, 2)
+                        os.close(old_stderr_fno)
+            except Exception:
+                # If dup/dup2 not available or fails, fall back to contextlib.redirect_stderr
+                with contextlib.redirect_stderr(sys.stderr):
+                    yield
+
         try:
             with pdfplumber.open(doc_path) as pdf:
                 for page in pdf.pages:
-                    text = page.extract_text(x_tolerance=2)
-                    if text:
-                        full_text += text + "\n"
-                    
-                    img_pil = page.to_image(resolution=300).original
-                    ocr_text = pytesseract.image_to_string(img_pil)
-                    full_text += ocr_text + "\n"
+                    try:
+                        text = page.extract_text(x_tolerance=2)
+                        if text:
+                            full_text += text + "\n"
+                    except Exception as page_text_e:
+                        print(f"Warning: could not extract page text for {doc_path}: {page_text_e}")
 
-                    qr_codes = decode(img_pil)
-                    for qr in qr_codes:
-                        qr_content.add(qr.data.decode())
+                    # Render page to an image for OCR and QR scanning. Convert to RGB to be safe.
+                    try:
+                        img_pil = page.to_image(resolution=300).original.convert('RGB')
+                    except Exception as img_e:
+                        print(f"Warning: could not render page image for OCR for {doc_path}: {img_e}")
+                        continue
 
-            return full_text.strip(), "; ".join(qr_content) if qr_content else None
-        
+                    try:
+                        ocr_text = pytesseract.image_to_string(img_pil)
+                        if ocr_text:
+                            full_text += ocr_text + "\n"
+                    except Exception as ocr_e:
+                        print(f"Warning: pytesseract failed on page image for {doc_path}: {ocr_e}")
+
+                    # Decode QR codes, but suppress noisy zbar stderr and catch exceptions so one bad page
+                    # won't stop the whole document processing.
+                    try:
+                        with _suppress_stderr():
+                            qr_codes = []
+                            try:
+                                qr_codes = decode(img_pil)
+                            except Exception as decode_e:
+                                # pyzbar sometimes raises on malformed images; log and continue
+                                print(f"Warning: pyzbar.decode failed for {doc_path}: {decode_e}")
+
+                            for qr in qr_codes or []:
+                                try:
+                                    qr_content.add(qr.data.decode())
+                                except Exception:
+                                    # If decoding bytes fails, ignore this QR
+                                    pass
+                    except Exception as stderr_e:
+                        # If suppression wrapper fails, continue without breaking whole PDF
+                        print(f"Warning: failed suppressing stderr for QR decode on {doc_path}: {stderr_e}")
+
+            # Return text (possibly empty) and qr_data (None if empty)
+            return full_text.strip(), "; ".join(sorted(qr_content)) if qr_content else None
+
         except Exception as e:
             print(f"Error extracting from PDF {doc_path}: {str(e)}")
             return None, None
@@ -259,12 +270,31 @@ class DocumentProcessor:
     def extract_text_from_image(self, img_path):
         """Extract text and QR codes from images, supporting all common formats."""
         try:
-            img_pil = Image.open(img_path)
-            text = pytesseract.image_to_string(img_pil)
-            qr_codes = decode(img_pil)
+            img_pil = Image.open(img_path).convert('RGB')
+            text = ""
+            try:
+                text = pytesseract.image_to_string(img_pil)
+            except Exception as ocr_e:
+                print(f"Warning: pytesseract failed on image {img_path}: {ocr_e}")
 
-            qr_content = "; ".join(qr.data.decode() for qr in qr_codes) if qr_codes else None
-            return text.strip(), qr_content
+            qr_content = None
+            try:
+                # Suppress zbar assertions and guard decode
+                with open(os.devnull, 'w') as devnull:
+                    old_stderr_fno = os.dup(2)
+                    os.dup2(devnull.fileno(), 2)
+                    try:
+                        qr_codes = decode(img_pil)
+                    finally:
+                        os.dup2(old_stderr_fno, 2)
+                        os.close(old_stderr_fno)
+
+                if qr_codes:
+                    qr_content = "; ".join(qr.data.decode() for qr in qr_codes)
+            except Exception as decode_e:
+                print(f"Warning: pyzbar.decode failed for image {img_path}: {decode_e}")
+
+            return text.strip() if text else "", qr_content
         except Exception as e:
             print(f"Error extracting from Image {img_path}: {str(e)}")
             return None, None
@@ -272,15 +302,14 @@ class DocumentProcessor:
     def extract_text_from_excel(self, excel_path):
         """Extract text from Excel files, supporting all standard formats."""
         try:
-            excel_path_str = str(excel_path)
-            if excel_path_str.endswith('.csv'):
+            if excel_path.endswith('.csv'):
                 # Handle CSV using pandas
-                df = pd.read_csv(excel_path_str)
+                df = pd.read_csv(excel_path)
                 return df.to_string()
 
-            elif excel_path_str.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')):
+            elif excel_path.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')):
                 # Handle Excel files using openpyxl for better compatibility
-                wb = openpyxl.load_workbook(excel_path_str, data_only=True)
+                wb = openpyxl.load_workbook(excel_path, data_only=True)
                 sheets_text = []
 
                 for sheet in wb.worksheets:
@@ -295,24 +324,12 @@ class DocumentProcessor:
             print(f"Error extracting from Excel {excel_path}: {str(e)}")
             return None
 
-    @staticmethod
-    def clean_filename(name):
-        name = normalize('NFKC', name).strip().replace('"', '').replace("'", '')
-        return name
-    
     def is_file_in_database(self, conn, file_name):
         """Check if a file exists in the database."""
         cursor = conn.cursor()
-        file_name = self.clean_filename(file_name)
         cursor.execute("SELECT 1 FROM document_data WHERE file_name = ?", (file_name,))
         return cursor.fetchone() is not None
     
-    def is_content_in_database(self, conn, content_hash):
-        """Check if a file with the same content hash exists in the database."""
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM document_data WHERE content_hash = ?", (content_hash,))
-        return cursor.fetchone() is not None
-
     def process_queue(self):
         """Process Documents from the queue continuously using parallel processing."""
         while True:
@@ -325,7 +342,7 @@ class DocumentProcessor:
     
     def log_failed_file(self, file_name):
         """ Stores failed/corrupted/unreadable file names in failed_files.json as a JSON list. Ensures uniqueness—no duplicate names."""
-        failed_log_path = self.failed_log_path
+        failed_log_path = self.db_path.parent / "failed_files.json"
         try:
             if failed_log_path.exists():
                 with open(failed_log_path, "r", encoding="utf-8") as f:
@@ -333,7 +350,6 @@ class DocumentProcessor:
             else:
                 existing_names = set()
             
-            file_name = self.clean_filename(file_name)
             if file_name not in existing_names:
                 existing_names.add(file_name)
                 with open(failed_log_path, "w", encoding="utf-8") as f:
@@ -341,72 +357,66 @@ class DocumentProcessor:
         except Exception as log_e:
             print(f"[Log Error] Could not write to failed_files.json: {log_e}")
 
-
-    def process_single_document(self, remote_path):
-        file_name = Path(remote_path).name
+    def process_single_document(self, doc_path):
+        """Process a document while ensuring it's not duplicated in the database."""
         conn = self.get_db_connection()
-
-        temp_path = None
         try:
-            # Always fetch from remote
-            file_obj = self.remote_manager.fetch_file(remote_path)
-            temp_path = Path("temp") / file_name
-            temp_path.parent.mkdir(exist_ok=True)
-            with open(temp_path, "wb") as f:
-                f.write(file_obj.read())
-            process_path = temp_path
+            doc_path = Path(doc_path)
+            file_name = doc_path.name
 
-            # Extraction logic (choose extractor based on file type)
-            ext = process_path.suffix.lower()
-            text, qr_data = None, None
-            if ext == ".pdf":
-                text, qr_data = self.extract_text_from_pdf(process_path)
-            elif ext in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp']:
-                text, qr_data = self.extract_text_from_image(process_path)
-            elif ext in ['.docx', '.doc', '.docm', '.dotx', '.dotm']:
-                text = self.extract_text_from_word(process_path)
-            elif ext in ['.xlsx', '.xls', '.xlsm', '.csv', '.xlsb']:
-                text = self.extract_text_from_excel(process_path)
-            elif ext == ".txt":
-                text = self.extract_text_from_txt(process_path)
+            handler = DocumentHandler(self)
 
-            # Compute content hash
-            content_hash = hashlib.sha256(text.encode('utf-8')).hexdigest() if text else None
-
-            # Check for duplicate by content only (regardless of name)
-            if content_hash and self.is_content_in_database(conn, content_hash):
-                print(f"Skipping file with duplicate content: {file_name}")
+            if doc_path.suffix.lower() not in handler.valid_extensions:
+                print(f"Skipping unsupported file type: {file_name}")
+                return
+            
+            if self.is_file_in_database(conn, file_name):
+                print(f"Skipping duplicate file: {file_name}")
                 return
 
-            # Check for duplicate by name and content (optional, for clarity)
-            if self.is_file_in_database(conn, file_name):
-                cursor = conn.cursor()
-                cursor.execute("SELECT content_hash FROM document_data WHERE file_name = ?", (file_name,))
-                row = cursor.fetchone()
-                if row and row[0] == content_hash:
-                    print(f"Skipping duplicate file (same name and content): {file_name}")
-                    return
+            print(f"Processing and inserting: {file_name}")
 
-            # Insert into DB if extraction succeeded
-            if text and text.strip():
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO document_data (file_name, content, qr_data, content_hash) VALUES (?, ?, ?, ?);",
-                    (file_name, text, qr_data, content_hash)
-                )
-                conn.commit()
-                print(f"Successfully stored: {file_name}")
-            else:
+            text, qr_data = None, None
+            
+            try:
+                if doc_path.suffix.lower() in handler.image_extensions:
+                    text, qr_data = self.extract_text_from_image(doc_path)
+                elif doc_path.suffix.lower() in handler.word_extensions:
+                    text = self.extract_text_from_word(doc_path)
+                elif doc_path.suffix.lower() in handler.excel_extensions:
+                    text = self.extract_text_from_excel(doc_path)
+                elif doc_path.suffix.lower() == ".pdf":
+                    text, qr_data = self.extract_text_from_pdf(doc_path)
+                elif doc_path.suffix.lower() == ".txt":
+                    text = self.extract_text_from_txt(doc_path)
+
+            except Exception as inner_e:
+                print(f"Exception while extracting from {file_name}: {inner_e}")
+                self.log_failed_file(file_name)
+                return
+            
+            text_is_empty = (text is None or (isinstance(text, str) and not text.strip()))
+            qr_missing_in_pdf_or_image = (
+                (doc_path.suffix.lower() in handler.image_extensions + [".pdf"])
+                and qr_data is None
+            )
+
+            if text_is_empty:
                 print(f"Failed to extract text from: {file_name}")
                 self.log_failed_file(file_name)
-        except Exception as e:
-            print(f"Exception while processing {file_name}: {e}")
-            self.log_failed_file(file_name)
+                return
+
+            
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO document_data (file_name, content, qr_data) VALUES (?, ?, ?);",
+                (file_name, text, qr_data)
+            )
+            conn.commit()
+            print(f"Successfully stored: {file_name}")
+                
         finally:
             conn.close()
-            # Clean up temp file if used
-            if temp_path and temp_path.exists():
-                temp_path.unlink()
 
     def get_all_documents(self):
         """Retrieve all Documents names stored in the database."""
@@ -474,6 +484,14 @@ class DocumentProcessor:
             conn.close()
 
     def start_processing(self):
-        """Scan remote server once (no Watchdog for remote)."""
+        """Begin monitoring all folders with Watchdog."""
         self.load_existing_documents()
-        print("Remote scan complete.")
+
+        observer = Observer()
+        event_handler = DocumentHandler(self)
+
+        for base_dir in self.base_dirs:
+            observer.schedule(event_handler, str(base_dir), recursive=True)
+
+        observer.start()
+        return observer
