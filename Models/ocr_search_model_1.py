@@ -6,6 +6,8 @@ import pdfplumber
 import pytesseract
 import sys
 import contextlib
+import hashlib
+import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pathlib import Path
@@ -16,6 +18,9 @@ from PIL import Image
 import pandas as pd
 import openpyxl
 import json
+from io import BytesIO
+from Models.sql_connection.connection import execute_sql_query, execute_sql
+from Models.encryption_utils import AESGCMEncryption, IllegalStateException
 
 class DocumentHandler(FileSystemEventHandler):
     """Handler for document file system events."""
@@ -33,31 +38,48 @@ class DocumentHandler(FileSystemEventHandler):
             return
             
         print(f"\nNew document detected: {file_path}")
-        self.document_processor.process_single_document(file_path)
+        # File detected - processor will handle it once DB entry is ready
 
 class DocumentProcessor:
     _instance = None
     _lock = threading.Lock()
     
     @classmethod
-    # def get_instance(cls, base_dir="/home/ubuntu/dms_project/dms_documents", db_name="search-docs.db"):
-    # def get_instance(cls, base_dirs=["PDFs_Data", "Documentation"], db_name="search-docs.db"):
-    def get_instance(cls, base_dirs=["E:\FTP\DMS_Document"], db_name="search-docs.db"):
+    def get_instance(cls, base_dirs=["/Users/rozaltheric/Office Work/dms_project/FTP/"], db_name="search-docs.db", db_url=None, encryption_key=None):
         """Singleton accessor that supports multiple directories."""
         if not cls._instance:
-            cls._instance = cls(base_dirs, db_name)
+            cls._instance = cls(base_dirs, db_name, db_url, encryption_key)
             cls._instance.load_existing_documents()
         return cls._instance
 
-    def __init__(self, base_dirs, db_name):
-        """Initialize with multiple base directories."""
+    def __init__(self, base_dirs, db_name, db_url, encryption_key=None):
+        """Initialize with multiple base directories and optional encryption key."""
         if not base_dirs or not db_name:
             raise ValueError("base_dirs and db_name are required")
         self.base_dirs = [Path(d) for d in base_dirs]
         self.db_path = self.base_dirs[0] / db_name  # Store DB in first folder
+        self.db_url = db_url
+        
+        # Track max ID from document_details to detect new entries
+        self.max_id_lock = threading.Lock()
+        self.max_id = 0
+        self.polling_thread = None
+        self.stop_polling = False
+        
+        # Initialize encryption if key provided (16 bytes for AES-128)
+        self.encryption = None
+        if encryption_key:
+            if isinstance(encryption_key, str):
+                # Convert string to bytes (ensure it's 16 bytes)
+                encryption_key = encryption_key.encode('utf-8')[:16].ljust(16, b'\0')
+            self.encryption = AESGCMEncryption(encryption_key)
+        
         for base_dir in self.base_dirs:
             base_dir.mkdir(parents=True, exist_ok=True)
         self._initialize_db()
+        
+        # Initialize max_id from database
+        self._update_max_id()
     
     def _get_valid_extensions(self):
         """Return a list of supported extensions."""
@@ -66,64 +88,185 @@ class DocumentProcessor:
                 '.xlsx', '.xls', '.xlsm', '.csv', '.xlsb']
 
     def _initialize_db(self):
-        """Create the db file inside base_dir if it doesn't exist or recreate to include missing columns."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Check if the table exists
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='document_data';")
-        table_exists = cursor.fetchone()
-
-        if table_exists:
-            # Fetch existing data to migrate
-            cursor.execute("SELECT file_name, content FROM document_data;")
-            existing_data = cursor.fetchall()
-
-            # Drop the old virtual table
-            cursor.execute("DROP TABLE document_data;")
-            conn.commit()
-        
-        # Create the new virtual table with the qr_data column
         cursor.execute("""
-            CREATE VIRTUAL TABLE document_data USING FTS5(
-                file_name, content, qr_data
+            CREATE VIRTUAL TABLE IF NOT EXISTS document_data USING FTS5(
+                mysql_original_id UNINDEXED,
+                file_name,
+                content,
+                qr_data,
+                hash UNINDEXED
             );
         """)
+
         conn.commit()
-
-        # Restore the old data into the newly created table
-        if table_exists:
-            cursor.executemany("INSERT INTO document_data (file_name, content) VALUES (?, ?);", existing_data)
-            conn.commit()
-
         conn.close()
+
 
     def get_db_connection(self):
         """Create a new database connection for the current thread."""
         return sqlite3.connect(self.db_path)
 
+    def _update_max_id(self):
+        """Update the current max ID from document_details table (single connection, no slots wasted)."""
+        if not self.db_url:
+            return
+        try:
+            # Suppress logging for this query
+            import logging
+            logger = logging.getLogger('Models.sql_connection.connection')
+            old_level = logger.level
+            logger.setLevel(logging.WARNING)
+            
+            try:
+                query = "SELECT MAX(id) as max_id FROM document_details"
+                df = execute_sql_query(query, self.db_url)
+                if not df.empty and df.iloc[0]['max_id'] is not None:
+                    with self.max_id_lock:
+                        self.max_id = int(df.iloc[0]['max_id'])
+            finally:
+                logger.setLevel(old_level)
+        except Exception as e:
+            print(f"Error updating max_id: {e}")
+
+    def _get_new_entries_since_max_id(self):
+        """Get newly added entries from document_details since last max_id (single connection)."""
+        if not self.db_url:
+            return []
+        try:
+            with self.max_id_lock:
+                current_max = self.max_id
+            
+            # Suppress logging for this query since it runs frequently
+            import logging
+            logger = logging.getLogger('Models.sql_connection.connection')
+            old_level = logger.level
+            logger.setLevel(logging.WARNING)
+            
+            try:
+                query = "SELECT id, file_name FROM document_details WHERE id > :max_id ORDER BY id ASC"
+                df = execute_sql_query(query, self.db_url, params={'max_id': current_max})
+                
+                if not df.empty:
+                    # Update max_id to the latest one we found
+                    latest_id = int(df.iloc[-1]['id'])
+                    with self.max_id_lock:
+                        self.max_id = latest_id
+                    print(f"[DB Poll] Found {len(df)} new document(s): {', '.join(df['file_name'].astype(str).tolist())}")
+                    return df.to_dict('records')
+                return []
+            finally:
+                logger.setLevel(old_level)
+        except Exception as e:
+            print(f"Error getting new entries: {e}")
+            return []
+
+    def _poll_for_new_documents(self):
+        """Background thread that continuously polls for new document entries in DB and processes them."""
+        pending_files = {}  # Track files we've seen in DB but not on disk: {file_name: timestamp}
+        max_wait_time = 15  # Wait up to 15 seconds for file to appear on disk
+        
+        while not self.stop_polling:
+            try:
+                new_entries = self._get_new_entries_since_max_id()
+                if new_entries:
+                    for entry in new_entries:
+                        file_name = entry['file_name']
+                        if file_name not in pending_files:
+                            pending_files[file_name] = time.time()
+                            print(f"[Poll] Queued for processing: {file_name}")
+                
+                # Check all pending files to see if they exist on disk now
+                files_to_remove = []
+                for file_name, first_seen_time in list(pending_files.items()):
+                    found = False
+                    elapsed = time.time() - first_seen_time
+                    
+                    # Try to find the file recursively
+                    for base_dir in self.base_dirs:
+                        try:
+                            for f in base_dir.rglob(file_name):
+                                if f.is_file():
+                                    print(f"[Poll] Found on disk after {elapsed:.1f}s: {file_name} at {f}")
+                                    self.process_single_document(str(f))
+                                    found = True
+                                    files_to_remove.append(file_name)
+                                    break
+                        except Exception as search_e:
+                            print(f"[Poll] Error searching for {file_name}: {search_e}")
+                        
+                        if found:
+                            break
+                    
+                    # If file hasn't appeared after max_wait_time, give up
+                    if not found and elapsed > max_wait_time:
+                        print(f"[Poll] Timeout - file {file_name} not found after {max_wait_time}s")
+                        files_to_remove.append(file_name)
+                
+                # Remove processed/abandoned files from pending list
+                for file_name in files_to_remove:
+                    del pending_files[file_name]
+                
+                time.sleep(1)  # Poll every second
+            except Exception as e:
+                print(f"[Poll] Error in polling thread: {e}")
+                time.sleep(2)
+
+    def get_id_from_db(self, file_name):
+        if not self.db_url:
+            return None
+        query = "SELECT id FROM document_details WHERE file_name = :file_name"
+        df = execute_sql_query(query, self.db_url, params={'file_name': file_name})
+        if not df.empty:
+            return df.iloc[0]['id']
+        # If not found, do not insert, return None
+        return None
+
     def load_existing_documents(self):
-        """Scan all base directories and index documents."""
+        """Scan all base directories (including subfolders) and index documents."""
         doc_files = []
         valid_exts = set(self._get_valid_extensions())
 
         for base_dir in self.base_dirs:
-            doc_files.extend(f for f in base_dir.rglob("*") if f.suffix.lower() in valid_exts)
+            # Use rglob to recursively find all files in nested directories
+            for file_path in base_dir.rglob("*"):
+                # Check if it's a file (not a directory)
+                if file_path.is_file():
+                    # Check if file extension matches
+                    if file_path.suffix.lower() in valid_exts:
+                        doc_files.append(file_path)
+                        print(f"  Found: {file_path.relative_to(base_dir)}")
 
         if not doc_files:
             print("No Documents found across configured directories.")
             return
 
-        print(f"Loading {len(doc_files)} Documents into the database...")
+        print(f"\nLoading {len(doc_files)} Documents into the database...")
         for doc_path in doc_files:
-            self.process_single_document(str(doc_path))
+            try:
+                self.process_single_document(str(doc_path))
+            except Exception as e:
+                print(f"Error processing {doc_path.name}: {e}")
 
         print("Database initialization complete.")
 
     def extract_text_from_pdf(self, doc_path):
-        """Extract text from PDF files."""
+        """Extract text from PDF files (automatically handles both encrypted and plaintext)."""
         full_text = ""
         qr_content = set()
+
+        # Try to decrypt if encryption is enabled
+        pdf_source = doc_path
+        if self.encryption:
+            try:
+                with open(doc_path, 'rb') as f:
+                    decrypted_stream = self.encryption.decrypt_stream(f)
+                pdf_source = decrypted_stream
+            except (IllegalStateException, Exception):
+                # File is not encrypted or decryption failed, try as plaintext
+                pdf_source = doc_path
 
         # Helper to silence C-level stderr (zbar assertions) during decode calls
         @contextlib.contextmanager
@@ -143,7 +286,7 @@ class DocumentProcessor:
                     yield
 
         try:
-            with pdfplumber.open(doc_path) as pdf:
+            with pdfplumber.open(pdf_source) as pdf:
                 for page in pdf.pages:
                     try:
                         text = page.extract_text(x_tolerance=2)
@@ -155,6 +298,10 @@ class DocumentProcessor:
                     # Render page to an image for OCR and QR scanning. Convert to RGB to be safe.
                     try:
                         img_pil = page.to_image(resolution=300).original.convert('RGB')
+                        # img_pil = self._auto_scale_for_ocr_pil(img_pil)
+
+                        custom_config = r'--oem 3 --psm 6 -c user_defined_dpi=300'
+                        ocr_text = pytesseract.image_to_string(img_pil, config=custom_config)
                     except Exception as img_e:
                         print(f"Warning: could not render page image for OCR for {doc_path}: {img_e}")
                         continue
@@ -196,12 +343,12 @@ class DocumentProcessor:
         
     def convert_to_docx(self, input_path):
         """ Convert .doc, .docm, .dotx, .dotm to .docx using unoconv. Always returns a string (output path) or None."""
-        input_path = str(input_path)  # Ensure string for subprocess
+        input_path = str(input_path)
         output_path = os.path.splitext(input_path)[0] + ".docx"
         try:
             subprocess.run(["unoconv", "-f", "docx", "-o", output_path, input_path], check=True)
             if os.path.exists(output_path):
-                return output_path  # always a string
+                return output_path
             else:
                 print(f"Conversion failed: {input_path} → {output_path}")
                 return None
@@ -210,25 +357,40 @@ class DocumentProcessor:
             return None
     
     def extract_text_from_word(self, doc_path):
-        """Extract text from various Word formats, including images."""
+        """Extract text from various Word formats, including images (automatically handles both encrypted and plaintext)."""
         ext = os.path.splitext(doc_path)[1].lower()
+        
+        # Try to decrypt first if encryption is enabled
+        decrypted_bytes = None
+        if self.encryption:
+            try:
+                with open(doc_path, 'rb') as f:
+                    decrypted_stream = self.encryption.decrypt_stream(f)
+                    decrypted_bytes = decrypted_stream.read()
+            except (IllegalStateException, Exception):
+                # File is not encrypted or decryption failed, will try as plaintext
+                pass
+        
+        # Convert to docx if needed
         if ext in ['.doc', '.docm', '.dotx', '.dotm']:
             converted_path = self.convert_to_docx(doc_path)
             if not converted_path:
                 return None
             doc_path = converted_path
-
-        if not os.path.exists(doc_path):
-            print(f"File does not exist: {doc_path}")
-            return None
-
+            ext = '.docx'
+        
         try:
-            doc = Document(doc_path)
+            # If we have decrypted bytes, use them; otherwise read from file
+            if decrypted_bytes:
+                doc = Document(BytesIO(decrypted_bytes))
+            else:
+                doc = Document(doc_path)
+            
             text_data = "\n".join([para.text for para in doc.paragraphs])
-
+            
             # Process images in the document
             image_texts = self.extract_text_from_word_images(doc)
-
+            
             return text_data + "\n\n" + image_texts
         except Exception as e:
             print(f"Error extracting text from {doc_path}: {str(e)}")
@@ -251,7 +413,11 @@ class DocumentProcessor:
                     f.write(image_bytes)
 
                 try:
-                    text = pytesseract.image_to_string(Image.open(str(image_path)))
+                    img_pil = Image.open(str(image_path)).convert('RGB')
+                    # img_pil = self._auto_scale_for_ocr_pil(img_pil)
+
+                    custom_config = r'--oem 3 --psm 6 -c user_defined_dpi=300'
+                    text = pytesseract.image_to_string(img_pil, config=custom_config)
                     image_texts.append(text.strip())
                 except Exception as e:
                     print(f"Error extracting text from image {image_path}: {str(e)}")
@@ -259,21 +425,57 @@ class DocumentProcessor:
         return "\n".join(image_texts)
     
     def extract_text_from_txt(self, txt_path):
-        """Extract text from .txt files."""
+        """Extract text from .txt files (automatically handles both encrypted and plaintext)."""
         try:
+            # Try to decrypt if encryption is enabled
+            if self.encryption:
+                try:
+                    with open(txt_path, 'rb') as f:
+                        decrypted_stream = self.encryption.decrypt_stream(f)
+                        return decrypted_stream.read().decode('utf-8', errors='ignore')
+                except (IllegalStateException, Exception):
+                    # File is not encrypted or decryption failed, try as plaintext
+                    pass
+            
+            # Read as plaintext
             with open(txt_path, 'r', encoding='utf-8') as file:
                 return file.read()
-        except Exception as e:
+        except (IllegalStateException, Exception) as e:
             print(f"Error extracting from TXT {txt_path}: {str(e)}")
             return None
     
     def extract_text_from_image(self, img_path):
-        """Extract text and QR codes from images, supporting all common formats."""
+        """Extract text and QR codes from images (automatically handles both encrypted and plaintext)."""
         try:
-            img_pil = Image.open(img_path).convert('RGB')
+            img_pil = None
+            
+            # Try to decrypt if encryption is enabled
+            if self.encryption:
+                try:
+                    with open(img_path, 'rb') as f:
+                        decrypted_stream = self.encryption.decrypt_stream(f)
+                        img_pil = Image.open(decrypted_stream)
+                        img_pil.load()  # Verify image is valid
+                        img_pil = img_pil.convert('RGB')
+                except (IllegalStateException, OSError, IOError, Exception):
+                    # File is not encrypted or decryption failed, try as plaintext
+                    pass
+            
+            # If decryption failed or encryption disabled, read as plaintext
+            if img_pil is None:
+                try:
+                    img_pil = Image.open(img_path)
+                    img_pil.load()  # Verify image is valid
+                    img_pil = img_pil.convert('RGB')
+                except (OSError, IOError) as open_err:
+                    print(f"Warning: Cannot open image {img_path}: {open_err}")
+                    print(f"Image file may be corrupted or not a valid format. Skipping...")
+                    return "", None
+            
             text = ""
             try:
-                text = pytesseract.image_to_string(img_pil)
+                custom_config = r'--oem 3 --psm 6 -c user_defined_dpi=300'
+                text = pytesseract.image_to_string(img_pil, config=custom_config)
             except Exception as ocr_e:
                 print(f"Warning: pytesseract failed on image {img_path}: {ocr_e}")
 
@@ -295,27 +497,47 @@ class DocumentProcessor:
                 print(f"Warning: pyzbar.decode failed for image {img_path}: {decode_e}")
 
             return text.strip() if text else "", qr_content
-        except Exception as e:
+        except (IllegalStateException, Exception) as e:
             print(f"Error extracting from Image {img_path}: {str(e)}")
             return None, None
         
     def extract_text_from_excel(self, excel_path):
-        """Extract text from Excel files, supporting all standard formats."""
+        """Extract text from Excel files, supporting all standard formats (automatically handles both encrypted and plaintext)."""
         try:
-            if excel_path.endswith('.csv'):
+            excel_path_str = str(excel_path)
+            
+            # Try to decrypt first if encryption is enabled
+            decrypted_bytes = None
+            if self.encryption:
+                try:
+                    with open(excel_path_str, 'rb') as f:
+                        decrypted_stream = self.encryption.decrypt_stream(f)
+                        decrypted_bytes = decrypted_stream.read()
+                except (IllegalStateException, Exception):
+                    # File is not encrypted or decryption failed, will try as plaintext
+                    pass
+            
+            if Path(excel_path_str).suffix.lower() == ".csv":
                 # Handle CSV using pandas
-                df = pd.read_csv(excel_path)
+                if decrypted_bytes:
+                    from io import StringIO
+                    df = pd.read_csv(StringIO(decrypted_bytes.decode('utf-8', errors='ignore')))
+                else:
+                    df = pd.read_csv(excel_path_str)
                 return df.to_string()
 
-            elif excel_path.endswith(('.xls', '.xlsx', '.xlsm', '.xlsb')):
-                # Handle Excel files using openpyxl for better compatibility
-                wb = openpyxl.load_workbook(excel_path, data_only=True)
+            elif Path(excel_path_str).suffix.lower() in [".xls", ".xlsx", ".xlsm", ".xlsb"]:
+                # Handle Excel files using openpyxl
+                if decrypted_bytes:
+                    wb = openpyxl.load_workbook(BytesIO(decrypted_bytes), data_only=True)
+                else:
+                    wb = openpyxl.load_workbook(excel_path_str, data_only=True)
+                
                 sheets_text = []
-
                 for sheet in wb.worksheets:
                     for row in sheet.iter_rows(values_only=True):
                         sheets_text.append(" ".join([str(cell) for cell in row if cell]))
-
+                
                 return "\n".join(sheets_text)
 
             else:
@@ -328,6 +550,12 @@ class DocumentProcessor:
         """Check if a file exists in the database."""
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM document_data WHERE file_name = ?", (file_name,))
+        return cursor.fetchone() is not None
+
+    def is_hash_in_database(self, conn, hash_value):
+        """Check if a hash exists in the database."""
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM document_data WHERE hash = ?", (hash_value,))
         return cursor.fetchone() is not None
     
     def process_queue(self):
@@ -358,7 +586,7 @@ class DocumentProcessor:
             print(f"[Log Error] Could not write to failed_files.json: {log_e}")
 
     def process_single_document(self, doc_path):
-        """Process a document while ensuring it's not duplicated in the database."""
+        """Process a document while checking for duplicate content."""
         conn = self.get_db_connection()
         try:
             doc_path = Path(doc_path)
@@ -369,26 +597,31 @@ class DocumentProcessor:
             if doc_path.suffix.lower() not in handler.valid_extensions:
                 print(f"Skipping unsupported file type: {file_name}")
                 return
-            
-            if self.is_file_in_database(conn, file_name):
-                print(f"Skipping duplicate file: {file_name}")
-                return
 
-            print(f"Processing and inserting: {file_name}")
+            print(f"Processing: {file_name}")
+
+            # Get id from MySQL (should be available since we waited in on_created)
+            doc_id = self.get_id_from_db(file_name)
+            if doc_id is None:
+                print(f"File {file_name} not found in document_details, skipping")
+                return
 
             text, qr_data = None, None
             
             try:
-                if doc_path.suffix.lower() in handler.image_extensions:
-                    text, qr_data = self.extract_text_from_image(doc_path)
-                elif doc_path.suffix.lower() in handler.word_extensions:
-                    text = self.extract_text_from_word(doc_path)
-                elif doc_path.suffix.lower() in handler.excel_extensions:
-                    text = self.extract_text_from_excel(doc_path)
-                elif doc_path.suffix.lower() == ".pdf":
-                    text, qr_data = self.extract_text_from_pdf(doc_path)
-                elif doc_path.suffix.lower() == ".txt":
-                    text = self.extract_text_from_txt(doc_path)
+                # Determine file type by extension (files may be encrypted but have original extensions)
+                file_ext = doc_path.suffix.lower()
+                
+                if file_ext in handler.image_extensions:
+                    text, qr_data = self.extract_text_from_image(str(doc_path))
+                elif file_ext in handler.word_extensions:
+                    text = self.extract_text_from_word(str(doc_path))
+                elif file_ext in handler.excel_extensions:
+                    text = self.extract_text_from_excel(str(doc_path))
+                elif file_ext == ".pdf":
+                    text, qr_data = self.extract_text_from_pdf(str(doc_path))
+                elif file_ext == ".txt":
+                    text = self.extract_text_from_txt(str(doc_path))
 
             except Exception as inner_e:
                 print(f"Exception while extracting from {file_name}: {inner_e}")
@@ -396,24 +629,146 @@ class DocumentProcessor:
                 return
             
             text_is_empty = (text is None or (isinstance(text, str) and not text.strip()))
-            qr_missing_in_pdf_or_image = (
-                (doc_path.suffix.lower() in handler.image_extensions + [".pdf"])
-                and qr_data is None
-            )
 
             if text_is_empty:
                 print(f"Failed to extract text from: {file_name}")
                 self.log_failed_file(file_name)
                 return
 
-            
+            # Compute hash based on content ONLY (not filename, to detect duplicates across versions)
+            normalized_text = " ".join(text.split())
+
+            # Create fingerprint without filename for duplicate detection
+            content_fingerprint = (
+                normalized_text[:5000] + "|" +
+                (qr_data or "")
+            )
+
+            hash_value = hashlib.sha256(content_fingerprint.encode("utf-8")).hexdigest()
+
+            # Check if hash exists in search-docs.db (duplicate content detection)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO document_data (file_name, content, qr_data) VALUES (?, ?, ?);",
-                (file_name, text, qr_data)
+                "SELECT mysql_original_id FROM document_data WHERE hash = ? ORDER BY mysql_original_id ASC LIMIT 1",
+                (hash_value,)
+            )
+            row = cursor.fetchone()
+            
+            if row is not None and row[0] is not None:
+                # Hash found with valid original ID
+                found_original_id = int(row[0])
+                current_id = int(doc_id)
+                
+                # Determine which is truly original: the one with LOWER ID
+                if current_id < found_original_id:
+                    # Current file has lower ID → current is ORIGINAL, found one is DUPLICATE
+                    # Update the FTS record to point to the true original
+                    cursor.execute(
+                        """
+                        UPDATE document_data
+                        SET mysql_original_id = ?
+                        WHERE mysql_original_id = ?
+                        """,
+                        (current_id, found_original_id)
+                    )
+                    conn.commit()
+                    
+                    # Mark the found_original_id as a duplicate of current
+                    execute_sql(
+                        """
+                        UPDATE document_details
+                        SET is_duplicate = 1,
+                            document_id = :original_id
+                        WHERE id = :duplicate_id
+                        """,
+                        self.db_url,
+                        {
+                            'original_id': current_id,
+                            'duplicate_id': found_original_id
+                        }
+                    )
+                    
+                    # Mark current as original
+                    execute_sql(
+                        """
+                        UPDATE document_details
+                        SET is_duplicate = 0,
+                            document_id = NULL
+                        WHERE id = :id
+                        """,
+                        self.db_url,
+                        {'id': current_id}
+                    )
+                    print(f"[Original] {file_name} (id={current_id}) is original, marking {found_original_id} as duplicate")
+                    return
+                else:
+                    # Current file has higher ID → current is DUPLICATE, found one is ORIGINAL
+                    execute_sql(
+                        """
+                        UPDATE document_details
+                        SET is_duplicate = 1,
+                            document_id = :original_id
+                        WHERE id = :current_id
+                        """,
+                        self.db_url,
+                        {
+                            'original_id': found_original_id,
+                            'current_id': current_id
+                        }
+                    )
+                    print(f"[Duplicate] {file_name} → original id {found_original_id}")
+                    return
+            
+            elif row is not None and row[0] is None:
+                # Corrupted FTS row (NULL original) - fix it
+                print(f"[REPAIR] Fixing NULL original for hash {hash_value}")
+                cursor.execute(
+                    """
+                    UPDATE document_data
+                    SET mysql_original_id = ?
+                    WHERE hash = ?
+                    """,
+                    (int(doc_id), hash_value)
+                )
+                conn.commit()
+                
+                # Mark as original since we fixed it
+                execute_sql(
+                    """
+                    UPDATE document_details
+                    SET is_duplicate = 0,
+                        document_id = NULL
+                    WHERE id = :id
+                    """,
+                    self.db_url,
+                    {'id': int(doc_id)}
+                )
+                return
+            
+            # Content hash NOT FOUND - this is a NEW/ORIGINAL file
+            # Insert its content into search-docs.db
+            cursor.execute(
+                """
+                INSERT INTO document_data
+                (mysql_original_id, file_name, content, qr_data, hash)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(doc_id), file_name, text, qr_data, hash_value)
             )
             conn.commit()
-            print(f"Successfully stored: {file_name}")
+            print(f"[Original] Inserted {file_name} (id={doc_id}) as original file")
+            
+            # Update MySQL: Mark current file as original (not a duplicate)
+            execute_sql(
+                """
+                UPDATE document_details
+                SET is_duplicate = 0,
+                    document_id = NULL
+                WHERE id = :id
+                """,
+                self.db_url,
+                {'id': int(doc_id)}
+            )
                 
         finally:
             conn.close()
@@ -423,52 +778,77 @@ class DocumentProcessor:
         conn = self.get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT file_name FROM document_data")
-            return [row[0] for row in cursor.fetchall()]
+            cursor.execute("SELECT mysql_original_id, file_name FROM document_data")
+            return [
+                {
+                    "mysql_original_id": row[0],
+                    "file_name": row[1]
+                } for row in cursor.fetchall()]
         finally:
             conn.close()
 
     def search_database(self, query, selected_files=None):
-        """Search the database for documents containing the specified query, including special characters."""
+        """Search the database and return mysql_original_id + file_name."""
         conn = self.get_db_connection()
         try:
             cursor = conn.cursor()
 
             fts_query = f'"{query}"'
+            wildcard_query = f"%{query}%"
 
+            placeholders = None
             if selected_files:
                 placeholders = ','.join('?' * len(selected_files))
+
+            if selected_files:
                 match_sql = f"""
-                    SELECT DISTINCT file_name 
-                    FROM document_data 
-                    WHERE content MATCH ? 
-                    AND file_name IN ({placeholders})
+                    SELECT DISTINCT mysql_original_id, file_name
+                    FROM document_data
+                    WHERE content MATCH ?
+                    AND mysql_original_id IN ({placeholders})
                 """
                 cursor.execute(match_sql, (fts_query, *selected_files))
             else:
-                cursor.execute("SELECT DISTINCT file_name FROM document_data WHERE content MATCH ?", (fts_query,))
-            
-            results = [row[0] for row in cursor.fetchall()]
+                match_sql = """
+                    SELECT DISTINCT mysql_original_id, file_name
+                    FROM document_data
+                    WHERE content MATCH ?
+                """
+                cursor.execute(match_sql, (fts_query,))
 
-            # Fallback to LIKE if MATCH fails or returns nothing
-            if not results:
-                wildcard_query = f"%{query}%"
+            rows = cursor.fetchall()
+
+            if not rows:
                 if selected_files:
                     like_sql = f"""
-                        SELECT DISTINCT file_name 
-                        FROM document_data 
-                        WHERE content LIKE ? 
-                        AND file_name IN ({placeholders})
+                        SELECT DISTINCT mysql_original_id, file_name
+                        FROM document_data
+                        WHERE content LIKE ?
+                        AND mysql_original_id IN ({placeholders})
                     """
                     cursor.execute(like_sql, (wildcard_query, *selected_files))
                 else:
-                    cursor.execute("SELECT DISTINCT file_name FROM document_data WHERE content LIKE ?", (wildcard_query,))
-                results = [row[0] for row in cursor.fetchall()]
+                    like_sql = """
+                        SELECT DISTINCT mysql_original_id, file_name
+                        FROM document_data
+                        WHERE content LIKE ?
+                    """
+                    cursor.execute(like_sql, (wildcard_query,))
+
+                rows = cursor.fetchall()
+
+            results = [
+                {
+                    "mysql_original_id": row[0],
+                    "file_name": row[1]
+                }
+                for row in rows
+            ]
 
             return results
+
         finally:
             conn.close()
-
     
     def clean_database(self):
         """Delete all entries in the document_data table, effectively resetting the database."""
@@ -483,10 +863,19 @@ class DocumentProcessor:
         finally:
             conn.close()
 
-    def start_processing(self):
-        """Begin monitoring all folders with Watchdog."""
-        self.load_existing_documents()
+    
 
+    def start_processing(self):
+        """Begin monitoring all folders with Watchdog and start polling thread."""
+        # self.load_existing_documents()
+
+        # Start the polling thread for new database entries
+        self.stop_polling = False
+        self.polling_thread = threading.Thread(target=self._poll_for_new_documents, daemon=True)
+        self.polling_thread.start()
+        print("Document polling thread started")
+
+        # Also start Watchdog for real-time file detection
         observer = Observer()
         event_handler = DocumentHandler(self)
 

@@ -6,6 +6,7 @@ db-sqlite3
 pathlib
 watchdog
 numpy
+pdf2image
 pandas
 python-multipart
 ocrmypdf
@@ -16,3 +17,7 @@ pyzbar
 openpyxl
 sentence-transformers
 paramiko
+pymysql
+pypdf
+opencv-python
+pillow
